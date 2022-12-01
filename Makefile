@@ -3,6 +3,9 @@ CFLAGS = -c
 
 all: huffman_encoding
 
+debug: main.o huffman.o
+	$(CC) main.o huffman.o -g -o main
+
 huffman_encoding: main.o huffman.o
 	$(CC) main.o huffman.o -o main
 

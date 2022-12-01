@@ -1,10 +1,3 @@
-/* TODO:    check for '\0' while building huffman_tree_node.
- * TODO:    add checks in "public" functions that given arguments are valid 
-            (e.g. all pointers given are not NULL).
-            
- * WARN:    there are no checks for calloc returning NULL (no mem).
- */
-
 #include "./huffman.h"
 
 
@@ -16,6 +9,7 @@ struct huffman_tree {
 struct _huffman_tree_node {
     char        key;
     uint64_t    value;
+    bool        is_leaf;
 
     struct _huffman_tree_node * left;
     struct _huffman_tree_node * right;
@@ -37,7 +31,7 @@ huffman(char const * string) {
         struct _huffman_tree_node * r = _extract_minimum(h);
 
         struct _huffman_tree_node * s = \
-            _create_huffman_tree_node('\0', l->value + r->value);
+            _create_huffman_tree_node('\0', l->value + r->value, false);
         s->left = l; s->right = r;
 
         _insert(h, s);
@@ -51,7 +45,116 @@ huffman(char const * string) {
 }
 
 
-size_t *
+uint8_t const *
+compress_huffman(char const * str, uint64_t * size, uint8_t ** a) {
+    struct huffman_tree * t = huffman(str);
+
+    uint8_t memb_size = height(t) / 8 + 1;
+    uint8_t ** codes;
+
+    _get_huffman_codes(t->root, &codes, NULL, 0, memb_size);
+
+    uint64_t * frequencies = get_char_frequencies(t);
+
+    uint8_t counter = 0;
+    for (uint16_t i = 0; i < 256; ++i)
+        if (frequencies[i] != 0) ++counter;
+
+    /* Period - number of bytes needed to store both ascii and prefix codes
+     * of one character.  */
+    uint8_t     period          = memb_size + 1;
+    uint32_t    alphabet_size   = 2 + counter * period;
+
+    /* First 2 bytes are used to store number of characters in alphabet and
+     * number of bytes used to store prefix code for one character.  */
+    uint8_t * alphabet = calloc(alphabet_size, 1);
+    alphabet[0] = counter; alphabet[1] = memb_size;
+
+    uint8_t k = 0;
+    for (uint16_t i = 0; i < 256; ++i) {
+        if (frequencies[i] == 0)
+            continue;
+
+        alphabet[2 + k * period] = i;
+        for (size_t j = 0; j < memb_size; ++j)
+            alphabet[k * period + 3 + j] = codes[i][j];
+        ++k;
+    }
+
+    *a = alphabet;
+
+    /* At first we allocate for compressed string the same amount of memory
+     * it takes to store raw string.  */
+    uint8_t * compressed_string = calloc(strlen(str), 1);
+
+    uint8_t shift = 0;
+    /* Compressed size equals to number of fully used bytes (that have all
+     * bits set).  */
+    uint64_t raw_index = 0, compressed_size = 0;
+
+    while(str[raw_index] != '\0') {
+        uint8_t * code          = codes[str[raw_index++]];
+        uint8_t * shifted_code  = calloc(memb_size + 1, 1);                        
+        for (uint16_t i = 0; i < memb_size; ++i)
+            *(shifted_code + i) = *(code + i);
+
+        for (uint8_t i = memb_size; i > 0; --i) {
+            for (uint8_t j = 0; j < shift; ++j) {
+                shifted_code[i] >>= 1;
+
+                if (shifted_code[i - 1] & (1 << j))
+                    shifted_code[i] ^= 128;
+            }
+        }
+        
+        shifted_code[0] >>= shift;
+
+        for (uint16_t i = 0; i <= memb_size; ++i)
+            compressed_string[compressed_size++] ^= shifted_code[i];
+
+        while(compressed_string[compressed_size] == 0)
+            --compressed_size;
+        
+        uint8_t length = _get_prefix_code_length(code, memb_size);
+
+        shift = (length + shift) % 8;
+        compressed_string[compressed_size] ^= 1 << (7 - shift);
+        
+        free(shifted_code);
+    }
+
+    if (shift != 0) ++compressed_size;
+
+    uint8_t * compressed_string_2 = calloc(compressed_size, 1);
+    for (uint64_t i = 0; i < compressed_size; ++i)
+        compressed_string_2[i] = compressed_string[i];
+
+    *size = compressed_size;
+
+    /* Deallocating memory.  */
+    free(t);
+
+    for (uint16_t i = 0; i < 256; ++i)
+        free(codes[i]);
+
+    free(codes);
+    free(frequencies);
+    free(compressed_string);
+
+    return compressed_string_2;
+}
+
+
+char *
+decompress_huffman(uint8_t const * compressed_string,
+    uint64_t size, uint8_t * alphabet)
+{
+    struct huffman_tree * t = _restore_huffman_tree(alphabet);
+    return _decompress_huffman_using_tree(compressed_string, size, t);
+}
+
+
+uint64_t *
 get_char_frequencies(struct huffman_tree * t) {
     uint64_t * counts = calloc(256, 8);  /* Alphabet size.  */
     _infix_traverse(t->root, counts);
@@ -183,12 +286,13 @@ _initialize_heap() {
 
 
 static struct _huffman_tree_node *
-_create_huffman_tree_node(char key, uint64_t value) {
+_create_huffman_tree_node(char key, uint64_t value, bool is_leaf) {
     struct _huffman_tree_node * n = \
         calloc(1, sizeof(struct _huffman_tree_node));
 
     n->key = key;
     n->value = value;
+    n->is_leaf = is_leaf;
     n->left = NULL; n->right = NULL;
 
     return n;
@@ -198,11 +302,10 @@ _create_huffman_tree_node(char key, uint64_t value) {
 struct _heap *
 _count_char_frequencies(char const * string) {
     uint64_t * counts = calloc(256, 8);
-    uint64_t i = 0;
-
     for (uint16_t j = 0; j < 256; ++j)
         counts[j] = 0;
 
+    uint64_t i = 0;
     while (string[i] != '\0')
         counts[string[i++]] += 1;
 
@@ -213,7 +316,7 @@ _count_char_frequencies(char const * string) {
             continue;
 
         struct _huffman_tree_node * n = \
-            _create_huffman_tree_node((char)j, counts[j]);
+            _create_huffman_tree_node((char)j, counts[j], true);
 
         _insert(h, n);
     }
@@ -288,17 +391,17 @@ _get_huffman_codes(struct _huffman_tree_node * n, uint8_t *** codes,
 
 
 static uint8_t *
-_copy_prefix_code(uint8_t * path, uint8_t memb_size) {
+_copy_prefix_code(uint8_t * code, uint8_t memb_size) {
     uint8_t * p = calloc(memb_size, 1);
     for (uint8_t i = 0; i < memb_size; ++i)
-        *(p + i) = *(path + i);
+        *(p + i) = *(code + i);
 
     return p;
 }
 
 
 static void
-_append_prefix_code(uint8_t * c, uint8_t memb_size, uint8_t pos, uint8_t bit) {
+_append_prefix_code(uint8_t * c, uint8_t memb_size, uint8_t pos, bool bit) {
     /* First of all bit at pos must be set to 0 to perform bitwise or
      * correctly (probably, bitwise or is not the right choice).  */
     if (bit)
@@ -320,8 +423,8 @@ _get_prefix_code_length(uint8_t * c, uint8_t memb_size) {
         if (c[i] == 0)
             continue;
 
-        for (uint8_t j = 0; j < 8; ++j)
-            if (c[i] & (1 << j))
+        for (uint8_t j = 0; j < 8; ++j) /* Could change j < 8 to j < 7, because there is at leaste one 1 bit.  */
+            if (c[i] & (1 << j))    /* (1 << j) in O(n2) - need separate variable?  */
                 return i * 8 + (7 - j);
     }
 }
@@ -349,6 +452,116 @@ _cast_prefix_code_to_cstring(uint8_t * prefix_code, uint8_t memb_size) {
 }
 
 
+static struct huffman_tree *
+_restore_huffman_tree(uint8_t * codes) {
+    uint8_t     counter     = codes[0];
+    uint8_t     memb_size   = codes[1];
+    uint16_t    period      = memb_size + 1;
+
+    struct _huffman_tree_node * root = \
+        _create_huffman_tree_node('\0', 0, false);
+    struct _huffman_tree_node * node;
+
+    char        character;
+    uint32_t    code_index;
+
+    for (uint8_t i = 0; i < counter; ++i) {
+        node        = root;
+        character   = codes[2 + period * i];
+        code_index  = 3 + i * period;
+
+        uint8_t length = \
+            _get_prefix_code_length(codes + code_index, memb_size);
+
+        uint8_t mask, byte;
+
+        for (uint16_t bit = 0; bit < length - 1; ++bit) {
+            byte    = bit / 8;
+            mask    = bit % 8;
+
+            if (codes[code_index + byte] & (1 << (7 - mask))) {
+                if (node->right == NULL)
+                    node->right = _create_huffman_tree_node('\0', 0, false);
+
+                node = node->right;
+            }
+
+            else {
+                if (node->left == NULL)
+                    node->left = _create_huffman_tree_node('\0', 0, false);
+
+                node = node->left;
+            }
+        }
+
+        if (codes[code_index + (length - 1) / 8]
+                & (1 << (7 - (length - 1) % 8)))
+            node->right = _create_huffman_tree_node(character, 0, true);
+
+        else
+            node->left = _create_huffman_tree_node(character, 0, true);
+    }
+
+    return _create_huffman_tree(root);
+}
+
+
+static char *
+_decompress_huffman_using_tree(uint8_t const * compressed_string,
+    uint64_t size, struct huffman_tree * t)
+{
+    char * string = calloc(DEFAULT_STRING_SIZE, 1);
+    /* Using max function is needed to prevent the situation when
+     * DEFAULT_STRING_SIZE equals to 0 by some reason.  */
+    uint64_t max_string_size    = DEFAULT_STRING_SIZE;
+    uint64_t string_index       = 0;
+
+    uint8_t mask = 128;  /* 0b10000000.  */
+    uint64_t byte_index = 0;
+    struct _huffman_tree_node * node = t->root;
+
+    while (string_index < size) {
+        if (mask == 0) {
+            mask = 128;
+            ++byte_index;
+        }
+
+        if (compressed_string[byte_index] & mask)
+            node = node->right;
+
+        else
+            node = node->left;
+
+        if (node->is_leaf) {
+            string[string_index++] = node->key;
+            node = t->root;
+
+            if (string_index == max_string_size) {
+                max_string_size = string_index * 2;
+                char * new_string = calloc(max_string_size, 1);
+                for (uint64_t i = 0; i < string_index; ++i)
+                    new_string[i] = string[i];
+                
+                free(string);
+                string = new_string;
+            }
+        }
+
+        mask >>= 1;
+    }
+
+    string[string_index++] = '\0';
+
+    char * decompressed_string = calloc(string_index, 1);
+    for (uint64_t i = 0; i < string_index; ++i)
+        decompressed_string[i] = string[i];
+                
+    free(string);
+
+    return decompressed_string;
+}
+
+
 static void
 _swap(struct _huffman_tree_node * p, struct _huffman_tree_node * q) {
     if (p == q)
@@ -357,10 +570,13 @@ _swap(struct _huffman_tree_node * p, struct _huffman_tree_node * q) {
     struct _huffman_tree_node t;
     t.key = p->key; t.value = p->value;
     t.left = p->left; t.right = p->right;
+    t.is_leaf = p->is_leaf;
 
     p->key = q->key; p->value = q->value;
     p->left = q->left; p->right = q->right;
+    p->is_leaf = q->is_leaf;
 
     q->key = t.key; q->value = t.value;
     q->left = t.left; q->right = t.right;
+    q->is_leaf = t.is_leaf;
 }
